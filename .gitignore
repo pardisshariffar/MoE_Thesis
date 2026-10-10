@@ -1,0 +1,11 @@
+.venv/
+models/
+runs/
+runs_*/
+__pycache__/
+*.pyc
+.env
+*.token
+*.key
+hf_token*
+check_lu.py

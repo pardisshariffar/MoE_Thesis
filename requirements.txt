@@ -1,0 +1,10 @@
+torch
+transformers
+accelerate
+datasets
+safetensors
+peft
+sacrebleu
+matplotlib
+tensorboard
+huggingface_hub
