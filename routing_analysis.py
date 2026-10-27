@@ -28,7 +28,7 @@ except Exception:  # pragma: no cover - depends on transformers internals
 
 _ROUTING_CACHE: dict[int, list[dict[str, Any]]] = {}
 _CURRENT_LANG_TAGS: list[str] | None = None
-
+_CURRENT_ATTENTION_MASK: torch.Tensor | None = None  # FIX: real-token mask for masked pooling
 
 def clear_routing_cache() -> None:
     _ROUTING_CACHE.clear()
@@ -38,6 +38,10 @@ def set_current_lang_tags(lang_tags: list[str] | None) -> None:
     global _CURRENT_LANG_TAGS
     _CURRENT_LANG_TAGS = lang_tags
 
+
+def set_current_attention_mask(mask: torch.Tensor | None) -> None:
+    global _CURRENT_ATTENTION_MASK
+    _CURRENT_ATTENTION_MASK = mask
 
 def snapshot_routing_cache() -> dict[int, list[dict[str, Any]]]:
     return {layer: list(entries) for layer, entries in _ROUTING_CACHE.items()}
@@ -117,6 +121,16 @@ def attach_routing_hooks(
                 "lang_tags": lang_tags,
             }
 
+            # FIX: carry the attention mask so padding can be excluded when pooling.
+            if _CURRENT_ATTENTION_MASK is not None:
+                mask = _CURRENT_ATTENTION_MASK
+                entry["attn_mask"] = mask.detach().cpu() if detach else mask
+
+            # FIX: carry the attention mask so padding can be excluded when pooling.
+            if _CURRENT_ATTENTION_MASK is not None:
+                mask = _CURRENT_ATTENTION_MASK
+                entry["attn_mask"] = mask.detach().cpu() if detach else mask
+
             if store_topk:
                 top_k = min(ROUTING_TOP_K, probs.shape[-1])
                 _, top_idx = torch.topk(probs, k=top_k, dim=-1)
@@ -148,15 +162,26 @@ def routing_cache_to_sentence_distributions(
 
         sentence_vectors: list[torch.Tensor] = []
         for entry in entries:
-            probs: torch.Tensor = entry["probs"]
+            probs: torch.Tensor = entry["probs"]  # [B, T, 64]
             tags: list[str] = list(entry.get("lang_tags", ["unknown"] * probs.shape[0]))
             if len(tags) != probs.shape[0]:
                 tags = ["unknown"] * probs.shape[0]
 
+            # FIX: mean over real tokens only, not padding.
+            attn_mask = entry.get("attn_mask", None)
+
             for sample_idx, sample_lang in enumerate(tags):
                 if target_lang is not None and sample_lang != target_lang:
                     continue
-                sentence_vectors.append(probs[sample_idx].mean(dim=0))
+
+                sample_probs = probs[sample_idx]  # [T, 64]
+                if attn_mask is not None and attn_mask.shape[0] > sample_idx:
+                    m = attn_mask[sample_idx].to(sample_probs.dtype)  # [T]
+                    denom = m.sum().clamp_min(1.0)
+                    vec = (sample_probs * m.unsqueeze(-1)).sum(dim=0) / denom
+                else:
+                    vec = sample_probs.mean(dim=0)
+                sentence_vectors.append(vec)
 
         if sentence_vectors:
             by_layer[layer] = torch.stack(sentence_vectors, dim=0)

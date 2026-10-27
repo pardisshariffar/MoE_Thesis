@@ -83,6 +83,7 @@ from routing_analysis import (
     clear_routing_cache,
     remove_routing_hooks,
     routing_cache_to_sentence_distributions,
+    set_current_attention_mask,
     set_current_lang_tags,
     snapshot_routing_cache,
     visualize_saved_routing,
@@ -92,6 +93,12 @@ from routing_analysis import (
 def _checkpoint_ready(path: Path) -> bool:
     if not path.exists():
         return False
+
+    # FIX: new checkpoint format stores only the trainable params + tokenizer.
+    if (path / TRAINABLE_PARAMS_FILE).exists() and (path / "tokenizer.json").exists():
+        return True
+
+    # Legacy full-model checkpoint (kept for backward compatibility).
     if not (path / "config.json").exists():
         return False
     if not (path / "tokenizer.json").exists():
@@ -104,6 +111,9 @@ def _checkpoint_ready(path: Path) -> bool:
     return has_weights or has_index
 
 
+TRAINABLE_PARAMS_FILE = "trainable_params.safetensors"
+
+
 def _save_checkpoint(
     model: torch.nn.Module,
     tokenizer: AutoTokenizer,
@@ -111,13 +121,27 @@ def _save_checkpoint(
     step: int,
     metadata: dict[str, Any] | None = None,
 ) -> None:
+    # FIX: save only the trainable params (router + lm_head), not the frozen 6.8B
+    # backbone. Calling save_pretrained() on a 4-bit model tries to dequantize the
+    # whole backbone to fp16 and OOMs. The backbone never changes during training,
+    # so reloading the base model and overlaying these params reproduces the model.
+    from safetensors.torch import save_file
+
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(str(ckpt_dir))
+
+    trainable_state = {
+        name: param.detach().to(torch.float16).cpu().contiguous()
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    }
+    save_file(trainable_state, str(ckpt_dir / TRAINABLE_PARAMS_FILE))
     tokenizer.save_pretrained(str(ckpt_dir))
 
     train_state = {
         "step": step,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "checkpoint_format": "trainable_params_only",
+        "num_trainable_tensors": len(trainable_state),
     }
     if metadata is not None:
         train_state.update(metadata)
@@ -186,18 +210,47 @@ def _prepare_model_for_low_vram_training(
     }
 
 
-def load_base_model(download_if_missing: bool = True) -> tuple[torch.nn.Module, AutoTokenizer]:
+def _make_quant_config():
+    # FIX: 4-bit NF4 quantization for the frozen backbone so training fits in 16 GB.
+    # Router + lm_head stay in fp16 (they are the trainable parts); compute in fp16.
+    from transformers import BitsAndBytesConfig
+
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        # FIX: keep the trainable parts out of 4-bit. The router (mlp.gate) is what
+        # the method trains; lm_head is the LM objective. 4-bit params can't be trained,
+        # so these must stay in fp16.
+        llm_int8_skip_modules=["gate", "lm_head"],
+    )
+
+
+def load_base_model(
+    download_if_missing: bool = True,
+    quantized: bool = False,
+) -> tuple[torch.nn.Module, AutoTokenizer]:
     model_path = ensure_model_local(download_if_missing=download_if_missing)
 
     tokenizer = AutoTokenizer.from_pretrained(str(model_path), local_files_only=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        str(model_path),
-        local_files_only=True,
-        dtype=MODEL_RUNTIME.dtype,
-    ).to(MODEL_RUNTIME.device)
+    if quantized and torch.cuda.is_available():
+        # bitsandbytes places the model on GPU itself; do NOT call .to(device).
+        model = AutoModelForCausalLM.from_pretrained(
+            str(model_path),
+            local_files_only=True,
+            quantization_config=_make_quant_config(),
+            device_map={"": 0},
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            str(model_path),
+            local_files_only=True,
+            dtype=MODEL_RUNTIME.dtype,
+        ).to(MODEL_RUNTIME.device)
 
     return model, tokenizer
 
@@ -212,16 +265,54 @@ def _first_non_finite_parameter_name(model: torch.nn.Module) -> str | None:
     return None
 
 
-def _load_model_from_checkpoint(ckpt_dir: Path) -> tuple[torch.nn.Module, AutoTokenizer]:
+def _load_model_from_checkpoint(
+    ckpt_dir: Path,
+    quantized: bool = False,
+) -> tuple[torch.nn.Module, AutoTokenizer]:
+    # FIX: new checkpoints store only the trainable params. Load the base model
+    # (quantized or fp16) and overlay the saved router + lm_head weights.
+    if (ckpt_dir / TRAINABLE_PARAMS_FILE).exists():
+        from safetensors.torch import load_file
+
+        model, tokenizer = load_base_model(download_if_missing=True, quantized=quantized)
+
+        saved = load_file(str(ckpt_dir / TRAINABLE_PARAMS_FILE))
+        own = dict(model.named_parameters())
+        applied = 0
+        with torch.no_grad():
+            for name, tensor in saved.items():
+                target = own.get(name)
+                if target is None:
+                    continue
+                target.copy_(tensor.to(device=target.device, dtype=target.dtype))
+                applied += 1
+        print(f"[Checkpoint] overlaid {applied}/{len(saved)} trainable tensors from {ckpt_dir}")
+
+        bad_param = _first_non_finite_parameter_name(model)
+        if bad_param is not None:
+            raise RuntimeError(
+                f"Checkpoint at {ckpt_dir} contains non-finite values (first detected: {bad_param})."
+            )
+        return model, tokenizer
+
+    # Legacy full-model checkpoint.
     tokenizer = AutoTokenizer.from_pretrained(str(ckpt_dir), local_files_only=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        str(ckpt_dir),
-        local_files_only=True,
-        dtype=MODEL_RUNTIME.dtype,
-    ).to(MODEL_RUNTIME.device)
+    if quantized and torch.cuda.is_available():
+        model = AutoModelForCausalLM.from_pretrained(
+            str(ckpt_dir),
+            local_files_only=True,
+            quantization_config=_make_quant_config(),
+            device_map={"": 0},
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            str(ckpt_dir),
+            local_files_only=True,
+            dtype=MODEL_RUNTIME.dtype,
+        ).to(MODEL_RUNTIME.device)
 
     bad_param = _first_non_finite_parameter_name(model)
     if bad_param is not None:
@@ -232,40 +323,43 @@ def _load_model_from_checkpoint(ckpt_dir: Path) -> tuple[torch.nn.Module, AutoTo
     return model, tokenizer
 
 
-def load_or_init_model(model_type: str) -> tuple[torch.nn.Module, AutoTokenizer, str]:
+def load_or_init_model(
+    model_type: str,
+    quantized: bool = False,
+) -> tuple[torch.nn.Module, AutoTokenizer, str]:
     mode = model_type.lower()
 
     if mode == "baseline":
-        model, tokenizer = load_base_model(download_if_missing=True)
+        model, tokenizer = load_base_model(download_if_missing=True, quantized=quantized)
         return model, tokenizer, BASE_MODEL_NAME
 
     if mode == "cont":
         if _checkpoint_ready(MODEL2_CKPT_DIR):
             try:
-                model, tokenizer = _load_model_from_checkpoint(MODEL2_CKPT_DIR)
+                model, tokenizer = _load_model_from_checkpoint(MODEL2_CKPT_DIR, quantized=quantized)
                 return model, tokenizer, str(MODEL2_CKPT_DIR)
             except Exception as exc:
                 print(f"[Warn] Invalid Model 2 checkpoint, falling back to base model: {exc}")
 
-        model, tokenizer = load_base_model(download_if_missing=True)
+        model, tokenizer = load_base_model(download_if_missing=True, quantized=quantized)
         return model, tokenizer, BASE_MODEL_NAME
 
     if mode == "align":
         if _checkpoint_ready(MODEL3_CKPT_DIR):
             try:
-                model, tokenizer = _load_model_from_checkpoint(MODEL3_CKPT_DIR)
+                model, tokenizer = _load_model_from_checkpoint(MODEL3_CKPT_DIR, quantized=quantized)
                 return model, tokenizer, str(MODEL3_CKPT_DIR)
             except Exception as exc:
                 print(f"[Warn] Invalid Model 3 checkpoint, trying fallback: {exc}")
 
         if _checkpoint_ready(MODEL2_CKPT_DIR):
             try:
-                model, tokenizer = _load_model_from_checkpoint(MODEL2_CKPT_DIR)
+                model, tokenizer = _load_model_from_checkpoint(MODEL2_CKPT_DIR, quantized=quantized)
                 return model, tokenizer, str(MODEL2_CKPT_DIR)
             except Exception as exc:
                 print(f"[Warn] Invalid Model 2 checkpoint, falling back to base model: {exc}")
 
-        model, tokenizer = load_base_model(download_if_missing=True)
+        model, tokenizer = load_base_model(download_if_missing=True, quantized=quantized)
         return model, tokenizer, BASE_MODEL_NAME
 
     raise ValueError(f"Unsupported model_type '{model_type}'.")
@@ -416,7 +510,12 @@ def train_model_2_cont_pretrain(max_steps: int | None = None) -> Path:
     ensure_run_directories()
     set_global_seed(SEED)
 
-    model, tokenizer, init_source = load_or_init_model("cont")
+    use_quant = torch.cuda.is_available()  # FIX: 4-bit backbone for training so it fits in 16 GB
+    model, tokenizer, init_source = load_or_init_model("cont", quantized=use_quant)
+    if use_quant:
+        from peft import prepare_model_for_kbit_training
+
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
     low_vram_stats = _prepare_model_for_low_vram_training(model, mode="cont")
     model.train()
 
@@ -507,7 +606,14 @@ def train_model_3_align(max_steps: int | None = None) -> Path:
     ensure_run_directories()
     set_global_seed(SEED)
 
-    model, tokenizer, init_source = load_or_init_model("align")
+    use_quant = torch.cuda.is_available()  # FIX: 4-bit backbone for training so it fits in 16 GB
+    model, tokenizer, init_source = load_or_init_model("align", quantized=use_quant)
+    if use_quant:
+        from peft import prepare_model_for_kbit_training
+
+        # Gradient checkpointing OFF for M3: the alignment loss needs the routing
+        # activations retained (hooks store non-detached probs), which checkpointing drops.
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
     low_vram_stats = _prepare_model_for_low_vram_training(
         model,
         mode="align",
@@ -573,6 +679,7 @@ def train_model_3_align(max_steps: int | None = None) -> Path:
 
             clear_routing_cache()
             set_current_lang_tags([lang_a] * int(ids_a.shape[0]))
+            set_current_attention_mask(att_a)  # FIX: exclude padding when pooling routing
             _ = model(
                 input_ids=ids_a,
                 attention_mask=att_a,
@@ -583,6 +690,7 @@ def train_model_3_align(max_steps: int | None = None) -> Path:
 
             clear_routing_cache()
             set_current_lang_tags([lang_b] * int(ids_b.shape[0]))
+            set_current_attention_mask(att_b)  # FIX: exclude padding when pooling routing
             _ = model(
                 input_ids=ids_b,
                 attention_mask=att_b,
@@ -591,6 +699,7 @@ def train_model_3_align(max_steps: int | None = None) -> Path:
             )
             cache_b = snapshot_routing_cache()
             set_current_lang_tags(None)
+            set_current_attention_mask(None)  # FIX: reset after use
 
             stats_a = routing_cache_to_sentence_distributions(
                 cache_a,
@@ -663,6 +772,7 @@ def train_model_3_align(max_steps: int | None = None) -> Path:
                 )
     finally:
         set_current_lang_tags(None)
+        set_current_attention_mask(None)  # FIX: reset after use
         clear_routing_cache()
         remove_routing_hooks(hooks)
 
@@ -1490,3 +1600,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
