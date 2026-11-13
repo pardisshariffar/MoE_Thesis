@@ -510,7 +510,7 @@ def train_model_2_cont_pretrain(max_steps: int | None = None) -> Path:
     ensure_run_directories()
     set_global_seed(SEED)
 
-    use_quant = torch.cuda.is_available()  # FIX: 4-bit backbone for training so it fits in 16 GB
+    use_quant = torch.cuda.is_available() and (torch.cuda.get_device_properties(0).total_memory < 20 * 1024**3)  # fp16 on >=20GB GPUs: 4-bit load OOMs on this transformers version
     model, tokenizer, init_source = load_or_init_model("cont", quantized=use_quant)
     if use_quant:
         from peft import prepare_model_for_kbit_training
@@ -606,7 +606,7 @@ def train_model_3_align(max_steps: int | None = None) -> Path:
     ensure_run_directories()
     set_global_seed(SEED)
 
-    use_quant = torch.cuda.is_available()  # FIX: 4-bit backbone for training so it fits in 16 GB
+    use_quant = torch.cuda.is_available() and (torch.cuda.get_device_properties(0).total_memory < 20 * 1024**3)  # fp16 on >=20GB GPUs: 4-bit load OOMs on this transformers version
     model, tokenizer, init_source = load_or_init_model("align", quantized=use_quant)
     if use_quant:
         from peft import prepare_model_for_kbit_training

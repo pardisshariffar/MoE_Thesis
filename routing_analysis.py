@@ -494,10 +494,14 @@ def analyze_model_routing(
         lang: compute_routing_entropy(cache, lang) for lang in LANGS
     }
 
+    # FIX: compute every unordered language pair, not just the four EN-anchored
+    # ones. The old tuple omitted de-lu and nl-lu, so those cells of the saved
+    # JSD matrix fell back to 0.0 (impossible for distinct languages).
     pairwise_similarity: dict[str, dict[int, dict[str, float]]] = {}
-    for lang_a, lang_b in (("en", "de"), ("en", "nl"), ("de", "nl"), ("en", "lu")):
-        pair_name = f"{lang_a}-{lang_b}"
-        pairwise_similarity[pair_name] = compute_routing_similarity(cache, lang_a, lang_b)
+    for i, lang_a in enumerate(LANGS):
+        for lang_b in LANGS[i + 1:]:
+            pair_name = f"{lang_a}-{lang_b}"
+            pairwise_similarity[pair_name] = compute_routing_similarity(cache, lang_a, lang_b)
 
     summary = {
         "expert_load": {
