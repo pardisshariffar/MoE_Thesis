@@ -77,3 +77,20 @@
 
 **Code state at this run**
 - fp16 loader (use_quant only below 20 GB VRAM), batch size 1, trainable-params-only checkpoints. These fixes and the JSD-matrix pair fix were committed to the repo on 2026-11-13.
+
+## 2026-11-14 — Model 4 (router + LoRA on experts) implemented (not yet run)
+
+**What M4 is**
+- Same alignment objective, data, layers (5-10), lambda (0.1) and 1000-step schedule as M3, but each expert also carries a trainable low-rank adapter. Trainable set = router (mlp.gate) + lm_head + expert LoRA; the 6.8B expert backbone stays frozen. This is the router-only (M3) vs router+LoRA (M4) comparison.
+- In transformers >=5.x the 64 experts per layer are fused into 3-D tensors inside one OlmoeExperts module (gate_up_proj [E, 2I, H], down_proj [E, H, I]), not separate nn.Linear modules, so off-the-shelf PEFT target_modules cannot attach to them. M4 adds LoRA directly to the fused weights via a module swap (expert_lora.py: LoRAExperts / inject_expert_lora). Router module class is untouched, so the routing hooks still fire; LoRA B is zero-initialised, so step 0 equals the base model.
+- Config: LORA_R=8, LORA_ALPHA=16, LORA_DROPOUT=0.0, LEARNING_RATE_LORA=2e-6, MAX_STEPS_MODEL4=1000. Checkpoint: runs/checkpoints/model4_lora_align (trainable-params-only format; the eval loader detects the LoRA tensors and rebuilds the adapter before overlaying).
+
+**Verified before running (CPU, tiny 2-layer/4-expert OLMoE)**
+- LoRA injects into every MoE block; model is identical to base at init; trainable set is exactly router+lm_head+LoRA with the base experts frozen.
+- The alignment gradient (through the real routing hooks + JSD loss) reaches both the expert LoRA and the router.
+- Train -> save (fp16, trainable-only) -> rebuild -> eval-reload reproduces the trained model's logits (fp16 tolerance).
+
+**How to run (rented >=24 GB GPU recommended; experts stay fp16 even under 4-bit, so 16 GB is too tight)**
+- Train:  python models_and_training.py --mode lora_align
+- Eval all four and rebuild the comparison:  python models_and_training.py --mode eval --eval-model all
+- M4 joins comparison_metrics.csv as model_type "lora_align" once its checkpoint exists.

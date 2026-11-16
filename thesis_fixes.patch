@@ -1,0 +1,118 @@
+diff --git a/config.py b/config.py
+index 8db2f71..364e0f2 100644
+--- a/config.py
++++ b/config.py
+@@ -91,8 +91,8 @@ LU_HELDOUT_RATIO = 0.20
+ 
+ SEQUENCE_LENGTH = 1024
+ PARALLEL_MAX_LENGTH = 256
+-BATCH_SIZE_MONO = 2
+-BATCH_SIZE_PARALLEL = 2
++BATCH_SIZE_MONO = 1
++BATCH_SIZE_PARALLEL = 1
+ EVAL_BATCH_SIZE = 2
+ NUM_WORKERS = 0
+ 
+diff --git a/models_and_training.py b/models_and_training.py
+index cde1d80..eea4bef 100644
+--- a/models_and_training.py
++++ b/models_and_training.py
+@@ -510,7 +510,7 @@ def train_model_2_cont_pretrain(max_steps: int | None = None) -> Path:
+     ensure_run_directories()
+     set_global_seed(SEED)
+ 
+-    use_quant = torch.cuda.is_available()  # FIX: 4-bit backbone for training so it fits in 16 GB
++    use_quant = torch.cuda.is_available() and (torch.cuda.get_device_properties(0).total_memory < 20 * 1024**3)  # fp16 on >=20GB GPUs: 4-bit load OOMs on this transformers version
+     model, tokenizer, init_source = load_or_init_model("cont", quantized=use_quant)
+     if use_quant:
+         from peft import prepare_model_for_kbit_training
+@@ -606,7 +606,7 @@ def train_model_3_align(max_steps: int | None = None) -> Path:
+     ensure_run_directories()
+     set_global_seed(SEED)
+ 
+-    use_quant = torch.cuda.is_available()  # FIX: 4-bit backbone for training so it fits in 16 GB
++    use_quant = torch.cuda.is_available() and (torch.cuda.get_device_properties(0).total_memory < 20 * 1024**3)  # fp16 on >=20GB GPUs: 4-bit load OOMs on this transformers version
+     model, tokenizer, init_source = load_or_init_model("align", quantized=use_quant)
+     if use_quant:
+         from peft import prepare_model_for_kbit_training
+diff --git a/results_log.md b/results_log.md
+index 6cec430..0791399 100644
+--- a/results_log.md
++++ b/results_log.md
+@@ -28,4 +28,52 @@
+ 
+ **Notes for the thesis**
+ - The gap M3 should close is the generation gap, not the PPL gap. PPL on LU is only moderately worse than NL; chrF reveals the real problem.
+-- All four PPL numbers are from a single seed. Treat as point estimates until 3-seed re-run.
+\ No newline at end of file
++- All four PPL numbers are from a single seed. Treat as point estimates until 3-seed re-run.
++## 2026-10-29 — Full pipeline M1 / M2 / M3 (RTX 4090, 24 GB, fp16)
++
++**Setup**
++- GPU: rented RTX 4090, 24 GB (RunPod)
++- Precision: fp16 (NOT 4-bit; 4-bit load exceeded 24 GB on the installed transformers version)
++- Trainable: router (mlp.gate) + lm_head only; all 64 experts/layer frozen (~105 M params, 1.5%)
++- Training: 1000 steps each for M2 and M3; learning rate 2e-6; BATCH_SIZE_MONO = BATCH_SIZE_PARALLEL = 1 with gradient accumulation
++- Alignment (M3): JS divergence, layers 5-10, lambda = 0.1; pairs EN-DE, EN-NL, DE-NL
++- Data: EN/DE/NL Wikipedia (wikimedia/wikipedia, 20231101) ~1 M tokens; LU held out (never trained or aligned)
++- Eval: perplexity EN/DE/NL/LU; LU generation chrF/BLEU on 20% held-out split, 256 samples
++- Seed: 42, single run
++- Source files: runs/eval/comparison_metrics.csv, runs/eval/eval_{baseline,cont,align}.json, runs/routing_analysis/*_lang_jsd_matrix.csv
++
++**Perplexity (lower = better)** — from comparison_metrics.csv
++| Lang | M1 baseline | M2 cont | M3 align |
++|------|------:|------:|------:|
++| en   |  5.43 |  5.61 |  5.17 |
++| de   |  7.60 |  6.64 |  6.24 |
++| nl   | 11.37 |  9.72 |  8.95 |
++| lu (held-out) | 21.72 | 30.04 | 35.71 |
++
++**LU generation (chrF / BLEU)**
++| Metric | M1 | M2 | M3 |
++|--------|---:|---:|---:|
++| chrF | 7.01 | 6.45 | 6.10 |
++| BLEU | 0.32 | 0.24 | 0.20 |
++
++**Routing (EN-LU JSD, mean layers 5-10)**
++| | M1 | M2 | M3 |
++|--|---:|---:|---:|
++| EN-LU | 0.0415 | 0.0350 | 0.0334 (-19.5%) |
++
++**Finding**
++- Alignment improves every trained language (M3 best on EN/DE/NL) but harms held-out LU (PPL 21.72 -> 35.71).
++- Routing transferred to LU (EN-LU divergence fell ~20%) yet LU degraded: the method reached the held-out language, and the transfer was harmful. Hypothesis (beneficial transfer) not supported.
++
++**Expert-distribution analysis (from *_expert_load.csv)**
++- Corrected full pairwise JSD matrix (the saved matrix had de-lu / nl-lu as 0.0 because only 4 pairs were computed; code fixed on 2026-11-13):
++  en-de 0.0256->0.0205, en-nl 0.0240->0.0197, en-lu 0.0415->0.0334, de-nl 0.0043->0.0042, de-lu 0.0087->0.0086, nl-lu 0.0111->0.0092 (baseline -> align).
++- Only pairs that include English converge (~20%); pairs without English barely move: alignment pulls routing toward English.
++- DE/NL/LU share the same top experts in every middle layer (e.g. expert 33 in L8, expert 27 in L7); English uses a different set. LU-DE = 0.0087 vs LU-EN = 0.0415: LU natively routes with the continental Germanic cluster, not English.
++
++**Limitations**
++- Single seed; treat as point estimates until a 3-seed re-run.
++- Convergence is in the overall 64-expert distribution; the identity of the very top experts changes little.
++
++**Code state at this run**
++- fp16 loader (use_quant only below 20 GB VRAM), batch size 1, trainable-params-only checkpoints. These fixes and the JSD-matrix pair fix were committed to the repo on 2026-11-13.
+diff --git a/routing_analysis.py b/routing_analysis.py
+index e6e2521..90e0a59 100644
+--- a/routing_analysis.py
++++ b/routing_analysis.py
+@@ -494,10 +494,14 @@ def analyze_model_routing(
+         lang: compute_routing_entropy(cache, lang) for lang in LANGS
+     }
+ 
++    # FIX: compute every unordered language pair, not just the four EN-anchored
++    # ones. The old tuple omitted de-lu and nl-lu, so those cells of the saved
++    # JSD matrix fell back to 0.0 (impossible for distinct languages).
+     pairwise_similarity: dict[str, dict[int, dict[str, float]]] = {}
+-    for lang_a, lang_b in (("en", "de"), ("en", "nl"), ("de", "nl"), ("en", "lu")):
+-        pair_name = f"{lang_a}-{lang_b}"
+-        pairwise_similarity[pair_name] = compute_routing_similarity(cache, lang_a, lang_b)
++    for i, lang_a in enumerate(LANGS):
++        for lang_b in LANGS[i + 1:]:
++            pair_name = f"{lang_a}-{lang_b}"
++            pairwise_similarity[pair_name] = compute_routing_similarity(cache, lang_a, lang_b)
+ 
+     summary = {
+         "expert_load": {

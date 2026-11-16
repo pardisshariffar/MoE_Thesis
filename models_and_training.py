@@ -50,14 +50,20 @@ from config import (
     LEARNING_RATE,
     LEARNING_RATE_ALIGN,
     LEARNING_RATE_CONT,
+    LEARNING_RATE_LORA,
     LOG_EVERY,
+    LORA_ALPHA,
+    LORA_DROPOUT,
+    LORA_R,
     LOW_VRAM_TRAIN_LM_HEAD,
     LU_EVAL_SPLIT,
     LU_HELDOUT_RATIO,
     MAX_STEPS_MODEL2,
     MAX_STEPS_MODEL3,
+    MAX_STEPS_MODEL4,
     MODEL2_CKPT_DIR,
     MODEL3_CKPT_DIR,
+    MODEL4_CKPT_DIR,
     MODEL_RUNTIME,
     SAVE_EVERY,
     SEED,
@@ -88,6 +94,17 @@ from routing_analysis import (
     snapshot_routing_cache,
     visualize_saved_routing,
 )
+from expert_lora import checkpoint_has_expert_lora, inject_expert_lora
+
+
+def _all_eval_models() -> list[str]:
+    """The model set for --eval-model all. Model 4 (router+LoRA) is included
+    only once its checkpoint exists, so evaluating 'all' before M4 is trained
+    does not add a misleading base-model-fallback row."""
+    models = ["baseline", "cont", "align"]
+    if _checkpoint_ready(MODEL4_CKPT_DIR):
+        models.append("lora_align")
+    return models
 
 
 def _checkpoint_ready(path: Path) -> bool:
@@ -277,6 +294,10 @@ def _load_model_from_checkpoint(
         model, tokenizer = load_base_model(download_if_missing=True, quantized=quantized)
 
         saved = load_file(str(ckpt_dir / TRAINABLE_PARAMS_FILE))
+        # Model 4 checkpoints carry expert-LoRA tensors; rebuild the adapter
+        # structure (same param names) before overlaying the saved weights.
+        if checkpoint_has_expert_lora(saved.keys()):
+            inject_expert_lora(model, r=LORA_R, alpha=LORA_ALPHA, dropout=LORA_DROPOUT)
         own = dict(model.named_parameters())
         applied = 0
         with torch.no_grad():
@@ -351,6 +372,26 @@ def load_or_init_model(
                 return model, tokenizer, str(MODEL3_CKPT_DIR)
             except Exception as exc:
                 print(f"[Warn] Invalid Model 3 checkpoint, trying fallback: {exc}")
+
+        if _checkpoint_ready(MODEL2_CKPT_DIR):
+            try:
+                model, tokenizer = _load_model_from_checkpoint(MODEL2_CKPT_DIR, quantized=quantized)
+                return model, tokenizer, str(MODEL2_CKPT_DIR)
+            except Exception as exc:
+                print(f"[Warn] Invalid Model 2 checkpoint, falling back to base model: {exc}")
+
+        model, tokenizer = load_base_model(download_if_missing=True, quantized=quantized)
+        return model, tokenizer, BASE_MODEL_NAME
+
+    if mode == "lora_align":
+        # Resume an M4 checkpoint if present; otherwise start from M2 (same init
+        # as M3) so the router+LoRA run is comparable to the router-only run.
+        if _checkpoint_ready(MODEL4_CKPT_DIR):
+            try:
+                model, tokenizer = _load_model_from_checkpoint(MODEL4_CKPT_DIR, quantized=quantized)
+                return model, tokenizer, str(MODEL4_CKPT_DIR)
+            except Exception as exc:
+                print(f"[Warn] Invalid Model 4 checkpoint, trying fallback: {exc}")
 
         if _checkpoint_ready(MODEL2_CKPT_DIR):
             try:
@@ -794,6 +835,209 @@ def train_model_3_align(max_steps: int | None = None) -> Path:
     return MODEL3_CKPT_DIR
 
 
+def train_model_4_lora_align(max_steps: int | None = None) -> Path:
+    """Model 4: router + LoRA-on-experts alignment.
+
+    Identical alignment objective and data to Model 3, but each expert also
+    carries a trainable low-rank adapter (config.LORA_R). Trainable set =
+    router (mlp.gate) + lm_head + expert LoRA; the 6.8B expert backbone stays
+    frozen. This is the router-only (M3) vs router+LoRA (M4) comparison.
+    """
+    ensure_run_directories()
+    set_global_seed(SEED)
+
+    use_quant = torch.cuda.is_available() and (torch.cuda.get_device_properties(0).total_memory < 20 * 1024**3)  # fp16 on >=20GB GPUs: 4-bit load OOMs on this transformers version
+    model, tokenizer, init_source = load_or_init_model("lora_align", quantized=use_quant)
+    if use_quant:
+        from peft import prepare_model_for_kbit_training
+
+        # Gradient checkpointing OFF (same reason as M3): the alignment loss needs
+        # the routing activations retained; checkpointing would drop them.
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
+    low_vram_stats = _prepare_model_for_low_vram_training(
+        model,
+        mode="lora_align",
+        enable_gradient_checkpointing=False,
+    )
+    # Inject expert LoRA AFTER the freeze pass: the adapters are added as new
+    # trainable params on top of the frozen experts; router + lm_head remain
+    # trainable from the low-VRAM prep above.
+    n_lora_blocks = inject_expert_lora(model, r=LORA_R, alpha=LORA_ALPHA, dropout=LORA_DROPOUT)
+    print(f"[Model4] injected expert LoRA (r={LORA_R}, alpha={LORA_ALPHA}) into {n_lora_blocks} MoE blocks")
+    model.train()
+
+    mono_loader = build_mono_train_loader(tokenizer)
+    mono_iter = iter(mono_loader)
+
+    parallel_loaders = load_parallel_datasets(tokenizer)
+    parallel_iters = {pair: iter(loader) for pair, loader in parallel_loaders.items()}
+
+    steps = MAX_STEPS_MODEL4 if max_steps is None else max_steps
+
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    lr = LEARNING_RATE_LORA
+    optimizer = AdamW(trainable_params, lr=lr, weight_decay=WEIGHT_DECAY, eps=1e-6)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=WARMUP_STEPS,
+        num_training_steps=max(steps, WARMUP_STEPS + 1),
+    )
+
+    hooks = attach_routing_hooks(model, ALIGN_LAYERS, detach=False, store_topk=False)
+    writer = SummaryWriter(log_dir=str(TENSORBOARD_DIR / "model4_lora_align"))
+
+    optimizer.zero_grad(set_to_none=True)
+
+    lora_meta = {
+        "init_source": init_source,
+        "objective": "lm_plus_alignment_lora",
+        "align_lambda": ALIGN_LAMBDA,
+        "align_layers": ALIGN_LAYERS,
+        "lora_r": LORA_R,
+        "lora_alpha": LORA_ALPHA,
+        "lora_dropout": LORA_DROPOUT,
+        "low_vram": low_vram_stats,
+    }
+
+    try:
+        for step in range(1, steps + 1):
+            mono_batch, mono_iter = _next_batch(mono_loader, mono_iter)
+
+            input_ids = mono_batch["input_ids"].to(MODEL_RUNTIME.device)
+            attention_mask = mono_batch["attention_mask"].to(MODEL_RUNTIME.device)
+            labels = mono_batch["labels"].to(MODEL_RUNTIME.device)
+
+            lm_outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                use_cache=False,
+                output_router_logits=True,
+            )
+            lm_loss = lm_outputs.loss
+            if not torch.isfinite(lm_loss):
+                raise RuntimeError(
+                    f"Non-finite lm_loss detected at Model4 step={step}. "
+                    "Training aborted to avoid saving a corrupted checkpoint."
+                )
+
+            pair_name = random.choice(list(parallel_loaders.keys()))
+            pair_batch, pair_iter = _next_batch(parallel_loaders[pair_name], parallel_iters[pair_name])
+            parallel_iters[pair_name] = pair_iter
+
+            lang_a = str(pair_batch["lang_a"])
+            lang_b = str(pair_batch["lang_b"])
+
+            ids_a = pair_batch[lang_a].to(MODEL_RUNTIME.device)
+            att_a = pair_batch[f"attention_{lang_a}"].to(MODEL_RUNTIME.device)
+            ids_b = pair_batch[lang_b].to(MODEL_RUNTIME.device)
+            att_b = pair_batch[f"attention_{lang_b}"].to(MODEL_RUNTIME.device)
+
+            clear_routing_cache()
+            set_current_lang_tags([lang_a] * int(ids_a.shape[0]))
+            set_current_attention_mask(att_a)
+            _ = model(
+                input_ids=ids_a,
+                attention_mask=att_a,
+                use_cache=False,
+                output_router_logits=True,
+            )
+            cache_a = snapshot_routing_cache()
+
+            clear_routing_cache()
+            set_current_lang_tags([lang_b] * int(ids_b.shape[0]))
+            set_current_attention_mask(att_b)
+            _ = model(
+                input_ids=ids_b,
+                attention_mask=att_b,
+                use_cache=False,
+                output_router_logits=True,
+            )
+            cache_b = snapshot_routing_cache()
+            set_current_lang_tags(None)
+            set_current_attention_mask(None)
+
+            stats_a = routing_cache_to_sentence_distributions(
+                cache_a,
+                target_lang=lang_a,
+                layers=ALIGN_LAYERS,
+            )
+            stats_b = routing_cache_to_sentence_distributions(
+                cache_b,
+                target_lang=lang_b,
+                layers=ALIGN_LAYERS,
+            )
+
+            align_loss, align_meta = alignment_loss_fn(
+                routing_stats_langs={lang_a: stats_a, lang_b: stats_b},
+                align_layers=ALIGN_LAYERS,
+                align_lambda=ALIGN_LAMBDA,
+            )
+
+            if not torch.isfinite(align_loss):
+                raise RuntimeError(
+                    f"Non-finite align_loss detected at Model4 step={step}. "
+                    "Training aborted to avoid saving a corrupted checkpoint."
+                )
+
+            total_loss = (lm_loss + align_loss) / GRAD_ACCUM_STEPS
+            if not torch.isfinite(total_loss):
+                raise RuntimeError(
+                    f"Non-finite total_loss detected at Model4 step={step}. "
+                    "Training aborted to avoid saving a corrupted checkpoint."
+                )
+
+            total_loss.backward()
+
+            if step % GRAD_ACCUM_STEPS == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            writer.add_scalar("train/model4_lm_loss", float(lm_loss.detach().item()), step)
+            writer.add_scalar("train/model4_align_loss", float(align_loss.detach().item()), step)
+            writer.add_scalar(
+                "train/model4_alignment_raw",
+                float(align_meta["alignment_raw"]),
+                step,
+            )
+            writer.add_scalar("train/model4_total_loss", float((lm_loss + align_loss).detach().item()), step)
+            writer.add_scalar("train/model4_lr", float(scheduler.get_last_lr()[0]), step)
+
+            if step % LOG_EVERY == 0:
+                print(
+                    "[Model4] "
+                    f"step={step} lm_loss={lm_loss.item():.4f} "
+                    f"align_loss={align_loss.item():.4f} pair={pair_name}"
+                )
+
+            if step % SAVE_EVERY == 0:
+                _save_checkpoint(
+                    model,
+                    tokenizer,
+                    MODEL4_CKPT_DIR,
+                    step=step,
+                    metadata=lora_meta,
+                )
+    finally:
+        set_current_lang_tags(None)
+        set_current_attention_mask(None)
+        clear_routing_cache()
+        remove_routing_hooks(hooks)
+
+    _save_checkpoint(
+        model,
+        tokenizer,
+        MODEL4_CKPT_DIR,
+        step=steps,
+        metadata=lora_meta,
+    )
+
+    writer.close()
+    return MODEL4_CKPT_DIR
+
+
 def evaluate_model(
     model_type: str,
     seed: int | None = None,
@@ -807,7 +1051,7 @@ def evaluate_model(
     tag = output_tag or model_type
 
     model, tokenizer, source = load_or_init_model(model_type)
-    used_fallback = model_type in {"cont", "align"} and source == BASE_MODEL_NAME
+    used_fallback = model_type in {"cont", "align", "lora_align"} and source == BASE_MODEL_NAME
 
     mono_eval = build_eval_mono_datasets(tokenizer, max_chunks_per_lang=4_000)
     lu_ppl_dataset, luxgen_eval_loader = load_lu_eval_datasets(tokenizer)
@@ -951,7 +1195,7 @@ def _try_plot_eval_summary(summary: dict[str, Any], model_type: str) -> dict[str
 def generate_visualizations(eval_model: str) -> dict[str, Any]:
     ensure_run_directories()
 
-    model_types = ["baseline", "cont", "align"] if eval_model == "all" else [eval_model]
+    model_types = _all_eval_models() if eval_model == "all" else [eval_model]
     report: dict[str, Any] = {}
 
     for model_type in model_types:
@@ -1108,7 +1352,7 @@ def _try_plot_cross_model_comparison(rows: list[dict[str, Any]]) -> dict[str, st
 def build_thesis_evaluation_report(eval_model: str = "all") -> dict[str, Any]:
     ensure_run_directories()
 
-    requested_models = ["baseline", "cont", "align"] if eval_model == "all" else [eval_model]
+    requested_models = _all_eval_models() if eval_model == "all" else [eval_model]
     summaries: dict[str, dict[str, Any]] = {}
 
     for model_type in requested_models:
@@ -1293,7 +1537,7 @@ def build_thesis_evaluation_report(eval_model: str = "all") -> dict[str, Any]:
 
 def run_evaluation_suite(eval_model: str) -> None:
     if eval_model == "all":
-        for model_type in ("baseline", "cont", "align"):
+        for model_type in _all_eval_models():
             evaluate_model(model_type)
         build_thesis_evaluation_report(eval_model="all")
     else:
@@ -1307,7 +1551,7 @@ def run_multi_seed_evaluation_suite(
 ) -> dict[str, Any]:
     ensure_run_directories()
 
-    model_types = ["baseline", "cont", "align"] if eval_model == "all" else [eval_model]
+    model_types = _all_eval_models() if eval_model == "all" else [eval_model]
     rows: list[dict[str, Any]] = []
 
     for seed in seeds:
@@ -1510,6 +1754,7 @@ def parse_args() -> argparse.Namespace:
             "baseline",
             "cont",
             "align",
+            "lora_align",
             "eval",
             "multiseed_eval",
             "viz",
@@ -1520,7 +1765,7 @@ def parse_args() -> argparse.Namespace:
         "--eval-model",
         type=str,
         default="all",
-        choices=["baseline", "cont", "align", "all"],
+        choices=["baseline", "cont", "align", "lora_align", "all"],
         help="Used with --mode eval.",
     )
     parser.add_argument(
@@ -1568,6 +1813,11 @@ def main() -> None:
     if args.mode == "align":
         ckpt = train_model_3_align(max_steps=args.max_steps)
         print(f"Model 3 checkpoint saved to: {ckpt}")
+        return
+
+    if args.mode == "lora_align":
+        ckpt = train_model_4_lora_align(max_steps=args.max_steps)
+        print(f"Model 4 checkpoint saved to: {ckpt}")
         return
 
     if args.mode == "eval":

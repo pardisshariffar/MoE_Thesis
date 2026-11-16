@@ -23,6 +23,7 @@ RUNS_DIR = ROOT_DIR / "runs"
 CHECKPOINT_DIR = RUNS_DIR / "checkpoints"
 MODEL2_CKPT_DIR = CHECKPOINT_DIR / "model2_cont"
 MODEL3_CKPT_DIR = CHECKPOINT_DIR / "model3_align"
+MODEL4_CKPT_DIR = CHECKPOINT_DIR / "model4_lora_align"
 TENSORBOARD_DIR = RUNS_DIR / "tensorboard"
 ANALYSIS_DIR = RUNS_DIR / "routing_analysis"
 EVAL_DIR = RUNS_DIR / "eval"
@@ -108,6 +109,7 @@ WEIGHT_DECAY = 0.01
 WARMUP_STEPS = 100
 MAX_STEPS_MODEL2 = 1_000
 MAX_STEPS_MODEL3 = 1_000
+MAX_STEPS_MODEL4 = 1_000
 GRAD_ACCUM_STEPS = 1
 LOG_EVERY = 10
 SAVE_EVERY = 200
@@ -120,6 +122,15 @@ LOW_VRAM_TRAIN_LM_HEAD = False
 ALIGN_LAYERS = list(range(5, 11))
 ALIGN_LAMBDA = 0.1
 ALIGN_DISTANCE = "jsd"  # jsd | cosine
+
+# Model 4: router + LoRA-on-experts alignment. Same alignment objective as M3,
+# but each expert also gets a low-rank adapter (rank LORA_R) so the experts can
+# adapt, not just the routing. This is the router-only (M3) vs router+LoRA (M4)
+# comparison. See expert_lora.py for the fused-weight LoRA implementation.
+LORA_R = 8
+LORA_ALPHA = 16
+LORA_DROPOUT = 0.0
+LEARNING_RATE_LORA = 2e-6
 
 ROUTING_TOP_K = 8
 ROUTING_ANALYSIS_MAX_BATCHES = 30
