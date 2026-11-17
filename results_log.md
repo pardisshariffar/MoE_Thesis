@@ -94,3 +94,8 @@
 - Train:  python models_and_training.py --mode lora_align
 - Eval all four and rebuild the comparison:  python models_and_training.py --mode eval --eval-model all
 - M4 joins comparison_metrics.csv as model_type "lora_align" once its checkpoint exists.
+model_type,loaded_from,eval_json_path,luxgen_samples_path,ppl_en,ppl_de,ppl_nl,ppl_lu,ppl_mean,luxgen_bleu,luxgen_chrf,luxgen_token_f1_fallback
+baseline,allenai/OLMoE-1B-7B-0125,/workspace/MoE_Thesis/runs/eval/eval_baseline.json,/workspace/MoE_Thesis/runs/eval/luxgen_samples_baseline.jsonl,5.427284770091097,7.602523482701854,11.369216538801641,21.71682167939589,11.52896161774762,0.3205212049734573,6.988888931509807,
+cont,/workspace/MoE_Thesis/runs/checkpoints/model2_cont,/workspace/MoE_Thesis/runs/eval/eval_cont.json,/workspace/MoE_Thesis/runs/eval/luxgen_samples_cont.jsonl,5.71525888134181,6.71081548661989,9.720937384110556,30.399017394901612,13.136507286743466,0.23184640359471972,6.347310459426672,
+align,/workspace/MoE_Thesis/runs/checkpoints/model3_align,/workspace/MoE_Thesis/runs/eval/eval_align.json,/workspace/MoE_Thesis/runs/eval/luxgen_samples_align.jsonl,5.244831986673494,6.274907368103452,8.969798632045121,34.95094226642259,13.860120063311163,0.17515537288766567,6.025998700310362,
+lora_align,/workspace/MoE_Thesis/runs/checkpoints/model4_lora_align,/workspace/MoE_Thesis/runs/eval/eval_lora_align.json,/workspace/MoE_Thesis/runs/eval/luxgen_samples_lora_align.jsonl,5.009859344015603,5.946331630146233,8.506926535885231,33.408658488761034,13.217943999702026,0.22977145924081538,6.109306712357769,
